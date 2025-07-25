@@ -236,13 +236,10 @@ class Eyesy:
             # Validate palette structure
             valid_palettes = []
             for palette in data:
-                if (isinstance(palette, dict) and all(
-                    key in palette and 
-                    isinstance(palette[key], list) and 
-                    len(palette[key]) == 3 
-                    for key in ['a', 'b', 'c', 'd']
-                ):
-                    valid_palettes.append(palette)
+                if isinstance(palette, dict):
+                    if all(key in palette and isinstance(palette[key], list) and len(palette[key]) == 3 
+                          for key in ['a', 'b', 'c', 'd']):
+                        valid_palettes.append(palette)
             
             if valid_palettes:
                 self.palettes = valid_palettes
