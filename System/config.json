@@ -1,0 +1,19 @@
+{
+    "video_resolution": 3,
+    "audio_gain": 0.25,
+    "trigger_source": 0,
+    "fg_palette": 0,
+    "bg_palette": 0,
+    "midi_channel": 1,
+    "knob1_cc": 20,
+    "knob2_cc": 21,
+    "knob3_cc": 22,
+    "knob4_cc": 23,
+    "knob5_cc": 24,
+    "auto_clear_cc": 25,
+    "fg_palette_cc": -1,
+    "bg_palette_cc": -1,
+    "mode_cc": -1,
+    "notes_change_mode": false,
+    "pc_map": {}
+}
