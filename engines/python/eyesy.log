@@ -1,0 +1,12 @@
+2025-07-25 17:12:27,731 - INFO - Initializing EYESY system
+2025-07-25 17:12:27,734 - CRITICAL - Fatal error: Traceback (most recent call last):
+  File "/home/richard/EYESY_OS/engines/python/main.py", line 222, in main
+    peak, peak_r, lock, clocker = initialize_system()
+                                  ^^^^^^^^^^^^^^^^^^^
+  File "/home/richard/EYESY_OS/engines/python/main.py", line 147, in initialize_system
+    eyesy = eyesy.Eyesy()
+            ^^^^^
+UnboundLocalError: cannot access local variable 'eyesy' where it is not associated with a value
+
+2025-07-25 17:12:27,734 - INFO - Beginning shutdown (code: 1)
+2025-07-25 17:12:27,738 - INFO - Clean shutdown complete
