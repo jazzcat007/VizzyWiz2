@@ -220,7 +220,7 @@ class Eyesy:
     def load_palettes(self):
         """Load color palettes with improved error handling."""
         palettes_file = os.path.join(self.SYSTEM_PATH, "palettes.json")
-        
+    
         if not os.path.exists(palettes_file):
             print(f"Using default palettes (file not found: {palettes_file})")
             self.palettes = color_palettes.abcd_palettes
@@ -229,32 +229,32 @@ class Eyesy:
         try:
             with open(palettes_file, "r") as f:
                 data = json.load(f)
-            
+        
             if not isinstance(data, list):
                 raise ValueError("Palettes data is not a list")
-                
-            # Validate palette structure
-            valid_palettes = []
-            for palette in data:
-                if (isinstance(palette, dict) and all(
-                    key in palette 
-                    and isinstance(palette[key], list) 
-                    and len(palette[key]) == 3 
-                    for key in ['a', 'b', 'c', 'd']
-                ):
-                    valid_palettes.append(palette)
             
-            if valid_palettes:
-                self.palettes = valid_palettes
-                self.palettes_user_defined = True
-                print(f"Loaded {len(valid_palettes)} palettes from {palettes_file}")
-            else:
-                print("No valid palettes found, using defaults")
-                self.palettes = color_palettes.abcd_palettes
-                
-        except Exception as e:
-            print(f"Error loading palettes: {e}, using defaults")
+        # Validate palette structure - CORRECTED VERSION
+        valid_palettes = []
+        for palette in data:
+            if (isinstance(palette, dict) and 
+                all(key in palette and isinstance(palette[key], list) and len(palette[key]) == 3 
+                    for key in ['a', 'b', 'c', 'd'])):
+                valid_palettes.append(palette)
+        
+        if valid_palettes:
+            self.palettes_user_defined = True
+            print(f"Loaded {len(valid_palettes)} palettes from {palettes_file}")
+        else:
+            print("No valid palettes found, using defaults")
             self.palettes = color_palettes.abcd_palettes
+            
+    except Exception as e:
+        print(f"Error loading palettes: {e}, using defaults")
+        self.palettes = color_palettes.abcd_palettes
+            
+    except Exception as e:
+        print(f"Error loading palettes: {e}, using defaults")
+        self.palettes = color_palettes.abcd_palettes
 
     def load_config_file(self):
         """Load configuration with better error handling and validation."""
