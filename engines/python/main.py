@@ -1,17 +1,23 @@
+#!/usr/bin/env python3
 import os
+import sys
+import time
+import signal
+import traceback
+import logging
+import gc
 from multiprocessing import Process, Array, Value, Lock
 from ctypes import c_float
-import time
-import sys
-import psutil
 import math
-import traceback
+import psutil
+
 import pygame
 from pygame.locals import *
 import midi
 import eyesy
 from pythonosc import osc_server, dispatcher, udp_client
 from pythonosc.osc_message_builder import OscMessageBuilder
+
 import sound
 import osd
 import usbdrive
@@ -25,34 +31,42 @@ from screen_midi_settings import ScreenMIDISettings
 from screen_midi_pc_mapping import ScreenMIDIPCMapping
 from screen_flash_drive import ScreenFlashDrive
 
+# Configure logging
+logging.basicConfig(
+    filename=os.path.join(os.path.dirname(__file__), 'eyesy.log'),
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('eyesy')
+
 class OSCManager:
     def __init__(self, eyesy):
         self.eyesy = eyesy
         self.dispatcher = dispatcher.Dispatcher()
         self.server = None
         self.client = None
+        self.running = False
         
     def init(self):
-        # Setup OSC server
-        self.dispatcher.map("/knob/*", self.handle_knob)
-        self.dispatcher.map("/led", self.handle_led)
-        self.dispatcher.map("/mode", self.handle_mode)
-        
+        """Initialize OSC server and client"""
         try:
-            self.server = osc_server.ThreadingOSCUDPServer(
-                ("0.0.0.0", 12345),  # Listen on all interfaces
-                self.dispatcher
-            )
-            self.client = udp_client.SimpleUDPClient("127.0.0.1", 12346)  # For sending
+            self.dispatcher.map("/knob/*", self.handle_knob)
+            self.dispatcher.map("/led", self.handle_led)
+            self.dispatcher.map("/mode", self.handle_mode)
             
-            # Start server in a thread
+            self.server = osc_server.ThreadingOSCUDPServer(
+                ("0.0.0.0", 12345), self.dispatcher)
+            self.client = udp_client.SimpleUDPClient("127.0.0.1", 12346)
+            
             import threading
-            server_thread = threading.Thread(target=self.server.serve_forever)
-            server_thread.daemon = True
-            server_thread.start()
+            self.server_thread = threading.Thread(target=self.server.serve_forever)
+            self.server_thread.daemon = True
+            self.running = True
+            self.server_thread.start()
+            logger.info("OSC initialized successfully")
             return True
         except Exception as e:
-            print(f"OSC init failed: {str(e)}")
+            logger.error(f"OSC init failed: {str(e)}")
             return False
     
     def handle_knob(self, address, *args):
@@ -60,325 +74,349 @@ class OSCManager:
             knob_num = int(address.split('/')[-1])
             if 0 <= knob_num < len(self.eyesy.knobs):
                 self.eyesy.knobs[knob_num] = args[0]
-        except (IndexError, ValueError):
-            pass
-    
+        except (IndexError, ValueError) as e:
+            logger.warning(f"Invalid knob message: {address} {args}")
+
     def handle_led(self, address, value):
-        self.eyesy.led = int(value)
-    
+        try:
+            self.eyesy.led = int(value)
+            self.eyesy.new_led = True
+        except ValueError:
+            logger.warning(f"Invalid LED value: {value}")
+
     def handle_mode(self, address, value):
-        self.eyesy.set_mode_by_index(int(value))
-    
+        try:
+            self.eyesy.set_mode_by_index(int(value))
+        except ValueError:
+            logger.warning(f"Invalid mode index: {value}")
+
     def send(self, address, value):
         if self.client:
-            self.client.send_message(address, value)
-    
-    def recv(self):
-        # Handled automatically by the server thread
-        pass
-    
+            try:
+                self.client.send_message(address, value)
+            except Exception as e:
+                logger.error(f"OSC send failed: {str(e)}")
+
     def close(self):
+        self.running = False
         if self.server:
             self.server.shutdown()
+            self.server_thread.join(timeout=1.0)
+        logger.info("OSC closed")
+
+def handle_sigterm(signum, frame):
+    """Handle graceful shutdown on SIGTERM"""
+    logger.info("Received SIGTERM, shutting down")
+    exitexit(0)
 
 def exitexit(code):
-    print("EXIT exiting\n")
+    """Cleanup all resources and exit"""
+    logger.info(f"Beginning shutdown (code: {code})")
+    
+    print("\nShutting down EYESY...")
     pygame.display.quit()
     pygame.quit()
-    print("stopping audio process")
-    if audio_process.is_alive():  # Check if the process is still running
-        audio_process.terminate()  # Terminate the process
-        audio_process.join()       # Ensure the process has fully terminated
-    print("closing audio")
-    audio_process.close()  # Now it's safe to close the process
-    print("closing midi")
-    midi.close()
-    print("closing osc")
-    osc.close()
-    print("exiting...")
+    
+    # Audio process cleanup
+    if 'audio_process' in globals():
+        print("Stopping audio process...")
+        if audio_process.is_alive():
+            audio_process.terminate()
+            audio_process.join(timeout=1.0)
+            if audio_process.is_alive():
+                audio_process.kill()
+            audio_process.close()
+    
+    # Cleanup other components
+    if 'midi' in globals():
+        print("Closing MIDI...")
+        midi.close()
+    
+    if 'osc' in globals():
+        print("Closing OSC...")
+        osc.close()
+    
+    logger.info("Clean shutdown complete")
     sys.exit(code)
 
-print("starting...")
-
-# create eyesy object
-eyesy = eyesy.Eyesy()
-
-# Initialize OSC
-osc = OSCManager(eyesy)
-
-# begin init
-try:
-    # see if there is a USB drive and we can run from there
+def initialize_system():
+    """Initialize all system components"""
+    logger.info("Initializing EYESY system")
+    
+    # Create eyesy object
+    eyesy = eyesy.Eyesy()
+    
+    # Initialize OSC
+    osc = OSCManager(eyesy)
+    if not osc.init():
+        raise RuntimeError("Failed to initialize OSC")
+    
+    # Check for USB drive
     if usbdrive.mount_usb():
-        print("found USB drive, checking for modes")
+        logger.info("USB drive detected")
         if os.path.exists("/usbdrive/Modes"):
-            print("found USB drive with modes, using USB")
-            eyesy.GRABS_PATH =  "/usbdrive/Grabs/"
-            eyesy.MODES_PATH =  "/usbdrive/Modes/"
+            logger.info("Using modes from USB drive")
+            eyesy.GRABS_PATH = "/usbdrive/Grabs/"
+            eyesy.MODES_PATH = "/usbdrive/Modes/"
             eyesy.SCENES_PATH = "/usbdrive/Scenes/"
             eyesy.SYSTEM_PATH = "/usbdrive/System/"
             eyesy.running_from_usb = True
-        else:
-            print("no modes found on USB drive, using internal")
-    else:
-        print("no USB found, using internal")
-
+    
+    # Ensure directories exist
     eyesy.ensure_directories()
-
-    # load config
-    eyesy.load_config_file()
-
-    # load palettes
-    eyesy.load_palettes()
-
-    # setup osc
-    if not osc.init():
-        raise Exception("Failed to initialize OSC")
-
-    # midi
-    print("init midi")
-    midi.init()
-    eyesy.usb_midi_device = midi.input_port_usb
-    print(eyesy.usb_midi_device)
-
-    # setup alsa sound shared resources
-    print("init audio")
-    BUFFER_SIZE = 100
-    shared_buffer = Array(c_float, BUFFER_SIZE, lock=True)
-    shared_buffer_r = Array(c_float, BUFFER_SIZE, lock=True)
-    write_index = Value('i', 0)
-    gain = Value('f', 0)
-    peak = Value('f', 0)
-    peak_r = Value('f', 0)
-    lock = Lock()
-
-    # Start the audio processing in a separate process
-    audio_process = Process(target=sound.audio_processing, args=(shared_buffer, shared_buffer_r, write_index, gain, peak, peak_r, lock))
-    audio_process.start()
-
-    # init pygame
+    
+    # Load configuration
+    try:
+        eyesy.load_config_file()
+        if not hasattr(eyesy, 'RES') or eyesy.RES == (0,0):
+            eyesy.RES = (1280, 720)  # Default fallback
+    except Exception as e:
+        logger.error(f"Config load failed: {e}, using defaults")
+        eyesy.config = eyesy.DEFAULT_CONFIG
+        eyesy.RES = (1280, 720)
+    
+    # Initialize pygame
     pygame.init()
     pygame.mouse.set_visible(False)
     clocker = pygame.time.Clock()
+    
+    # Initialize display
+    try:
+        hwscreen = pygame.display.set_mode(eyesy.RES)
+        eyesy.xres, eyesy.yres = hwscreen.get_size()
+        logger.info(f"Display initialized at {eyesy.xres}x{eyesy.yres}")
+    except pygame.error as e:
+        logger.critical(f"Display init failed: {e}")
+        raise
+    
+    # Initialize audio
+    try:
+        BUFFER_SIZE = 100
+        shared_buffer = Array(c_float, BUFFER_SIZE, lock=True)
+        shared_buffer_r = Array(c_float, BUFFER_SIZE, lock=True)
+        write_index = Value('i', 0)
+        gain = Value('f', 0)
+        peak = Value('f', 0)
+        peak_r = Value('f', 0)
+        lock = Lock()
+        
+        audio_process = Process(
+            target=sound.audio_processing,
+            args=(shared_buffer, shared_buffer_r, write_index, gain, peak, peak_r, lock)
+        )
+        audio_process.start()
+        logger.info("Audio process started")
+    except Exception as e:
+        logger.error(f"Audio init failed: {e}")
+        raise
+    
+    return eyesy, osc, hwscreen, audio_process, shared_buffer, shared_buffer_r, gain, peak, peak_r, lock, clocker
 
-    print("pygame version " + pygame.version.ver)
-
-    # set led to running
-    osc.send("/led", 7)
-
-    # init fb and main surface hwscreen
-    print("opening frame buffer...")
-    hwscreen = pygame.display.set_mode(eyesy.RES)
-    eyesy.xres = hwscreen.get_width()
-    eyesy.yres = hwscreen.get_height()
-    print("opened screen at: " + str(hwscreen.get_size()))
-    hwscreen.fill((0,0,0))
-    pygame.display.flip()
-
-    # screen for mode to draw on
-    mode_screen = pygame.Surface((eyesy.xres, eyesy.yres))
-    eyesy.screen = mode_screen
-
-    # load modes, post banner if none found
-    if not eyesy.load_modes():
-        print("no modes found.")
-        osd.loading_banner(hwscreen, "No Modes found. Insert USB drive with Modes folder and restart.")
-        while True:
-            for event in pygame.event.get():
-                if event.type == QUIT:
-                    exitexit(0)
-                elif event.type == KEYDOWN:
-                    if event.key == K_ESCAPE:
+def main():
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    
+    try:
+        # Initialize all components
+        eyesy, osc, hwscreen, audio_process, \
+        shared_buffer, shared_buffer_r, gain, \
+        peak, peak_r, lock, clocker = initialize_system()
+        
+        # Main surfaces
+        mode_screen = pygame.Surface((eyesy.xres, eyesy.yres))
+        eyesy.screen = mode_screen
+        
+        # Load modes
+        if not eyesy.load_modes():
+            logger.error("No modes found")
+            osd.loading_banner(hwscreen, "No Modes found. Insert USB drive with Modes folder and restart.")
+            while True:
+                for event in pygame.event.get():
+                    if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
                         exitexit(0)
-            time.sleep(1)
+                time.sleep(1)
+        
+        # Initialize menu system
+        init_menu_system(eyesy)
+        
+        # Main loop
+        run_main_loop(eyesy, osc, hwscreen, mode_screen, 
+                     shared_buffer, shared_buffer_r,
+                     gain, peak, peak_r, lock, clocker)
+        
+    except Exception as e:
+        logger.critical(f"Fatal error: {traceback.format_exc()}")
+        exitexit(1)
 
-    # run setup functions if modes have them
-    print("running setup...")
-    for i in range(0, len(eyesy.mode_names)):
-        print(eyesy.mode_root)
-        try:
-            eyesy.set_mode_by_index(i)
-            mode = sys.modules[eyesy.mode]
-        except AttributeError:
-            print("mode not found, or has error")
-            continue
-        try:
-            osd.loading_banner(hwscreen, "Loading " + str(eyesy.mode))
-            print("setup " + str(eyesy.mode))
-            mode.setup(hwscreen, eyesy)
-            eyesy.memory_used = psutil.virtual_memory()[2]
-        except Exception as e:
-            print("error in setup, or setup not found")
-            print(traceback.format_exc())
-            continue
-
-    # load screen grabs
-    eyesy.load_grabs()
-
-    # load scenes
-    eyesy.load_scenes()
-
-    # set font for system stuff
-    eyesy.font = pygame.font.Font("font.ttf", 16)
-
-    # get total memory consumed
-    eyesy.memory_used = psutil.virtual_memory()[2]
-    eyesy.memory_used = (eyesy.memory_used / 75) * 100
-    if eyesy.memory_used > 100:
-        eyesy.memory_used = 100
-
-    # set initial mode
-    eyesy.set_mode_by_index(0)
-    mode = sys.modules[eyesy.mode]
-
-    # menu screens
-    eyesy.menu_screens["home"] = ScreenMainMenu(eyesy)
-    eyesy.menu_screens["test"] = ScreenTest(eyesy)
-    eyesy.menu_screens["video_settings"] = ScreenVideoSettings(eyesy)
-    eyesy.menu_screens["palette"] = ScreenPalette(eyesy)
-    eyesy.menu_screens["wifi"] = ScreenWiFi(eyesy)
-    eyesy.menu_screens["applogs"] = ScreenApplogs(eyesy)
-    eyesy.menu_screens["midi_settings"] = ScreenMIDISettings(eyesy)
-    eyesy.menu_screens["midi_pc_mapping"] = ScreenMIDIPCMapping(eyesy)
-    eyesy.menu_screens["flashdrive"] = ScreenFlashDrive(eyesy)
+def init_menu_system(eyesy):
+    """Initialize all menu screens"""
+    eyesy.menu_screens = {
+        "home": ScreenMainMenu(eyesy),
+        "test": ScreenTest(eyesy),
+        "video_settings": ScreenVideoSettings(eyesy),
+        "palette": ScreenPalette(eyesy),
+        "wifi": ScreenWiFi(eyesy),
+        "applogs": ScreenApplogs(eyesy),
+        "midi_settings": ScreenMIDISettings(eyesy),
+        "midi_pc_mapping": ScreenMIDIPCMapping(eyesy),
+        "flashdrive": ScreenFlashDrive(eyesy)
+    }
     eyesy.switch_menu_screen("home")
 
-    # used to measure fps
-    start = time.time()
-
-except Exception as e:
-    print(traceback.format_exc())
-    print("error with EYESY init")
-    exitexit(0)
-
-# Main loop
-while True:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            exitexit(0)
-        elif event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                exitexit(0)
-
-    try:
-        # Process OSC messages (handled automatically by server thread)
-        
-        # Check MIDI
-        midi.recv_ttymidi(eyesy)
-        midi.recv_usbmidi(eyesy)
-
-        # Update knobs and notes
-        eyesy.update_knobs_and_notes()
-        eyesy.update_key_repeater()
-        eyesy.check_gain_knob()
-        eyesy.knob_seq_run()
-        eyesy.set_knobs()
-
-        # Measure FPS
+def run_main_loop(eyesy, osc, hwscreen, mode_screen, 
+                 shared_buffer, shared_buffer_r,
+                 gain, peak, peak_r, lock, clocker):
+    """Main rendering and event loop"""
+    start_time = time.time()
+    last_usb_check = 0
+    
+    while True:
+        current_time = time.time()
         eyesy.frame_count += 1
-        if (eyesy.frame_count % 30) == 0:
-            now = time.time()
-            eyesy.fps = 1 / ((now - start) / 30)
-            start = now
-
-        # Update LED if changed
-        if eyesy.new_led:
-            osc.send("/led", eyesy.led)
-
-        # Audio processing
-        if not eyesy.key10_status:
-            with lock:
-                eyesy.audio_in[:] = shared_buffer[:]
-                eyesy.audio_in_r[:] = shared_buffer_r[:]
-                g = eyesy.config["audio_gain"]
-                gain.value = float((g * g * 50) + 1)
-                eyesy.audio_peak = peak.value
-                eyesy.audio_peak_r = peak_r.value
-                if eyesy.config["trigger_source"] in (0, 2):
-                    if eyesy.audio_peak > 20000 or eyesy.audio_peak_r > 20000:
-                        eyesy.trig = True
-        else:
-            if not eyesy.menu_mode:
-                undulate_p += .005
-                undulate = ((math.sin(undulate_p * 2 * math.pi) + 1) * 2) + .5
-                for i in range(len(eyesy.audio_in)):
-                    eyesy.audio_in[i] = int(math.sin((i / 100) * 2 * math.pi * undulate) * 25000)
-                    eyesy.audio_in_r[i] = eyesy.audio_in[i]
-                eyesy.audio_peak = 25000
-                eyesy.audio_peak_r = 25000
-
-        # Handle current mode
-        try:
-            mode = sys.modules[eyesy.mode]
-        except:
-            eyesy.error = f"Mode {eyesy.mode} not loaded, probably has errors."
-            print(eyesy.error)
-            pygame.time.wait(200)
-
-        if eyesy.screengrab_flag:
-            eyesy.screengrab()
-
-        eyesy.update_scene_save_key()
-
-        if eyesy.auto_clear:
-            mode_screen.fill(eyesy.bg_color)
-
-        if eyesy.run_setup:
-            eyesy.error = ''
-            try:
-                mode.setup(hwscreen, eyesy)
-            except Exception as e:
-                eyesy.error = traceback.format_exc()
-                print("error with setup: " + eyesy.error)
-
-        # Draw current mode
-        if not eyesy.menu_mode:
-            try:
-                mode.draw(mode_screen, eyesy)
-            except Exception as e:
-                eyesy.error = traceback.format_exc()
-                print("error with draw: " + eyesy.error)
-                pygame.time.wait(200)
-
-            hwscreen.blit(mode_screen, (0, 0))
-
-        # OSD
+        
+        # Handle events
+        for event in pygame.event.get():
+            if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
+                exitexit(0)
+        
+        # Periodic USB check (every 30 seconds)
+        if current_time - last_usb_check > 30:
+            if usbdrive.check_usb() and not eyesy.running_from_usb:
+                logger.info("New USB detected, restarting...")
+                exitexit(1)  # Restart to load from USB
+            last_usb_check = current_time
+        
+        # Update system state
+        update_system_state(eyesy, osc, shared_buffer, shared_buffer_r, gain, peak, peak_r, lock)
+        
+        # Handle mode rendering
+        handle_mode_rendering(eyesy, hwscreen, mode_screen)
+        
+        # Handle OSD
         if eyesy.show_osd and not eyesy.menu_mode:
             try:
                 osd.render_overlay_480(hwscreen, eyesy)
             except Exception as e:
-                eyesy.error = traceback.format_exc()
-                print("error with OSD: " + eyesy.error)
-                pygame.time.wait(200)
-
-        # Menu system
+                logger.error(f"OSD error: {e}")
+        
+        # Handle menu system
         if eyesy.menu_mode:
-            try:
-                eyesy.current_screen.handle_events()
-                eyesy.current_screen.render_with_title(hwscreen)
-            except Exception as e:
-                eyesy.error = traceback.format_exc()
-                print("error with Menu: " + eyesy.error)
-                pygame.time.wait(200)
-            
-            if eyesy.restart:
-                print("restart requested from menu, restarting")
-                exitexit(1)
-                
-            if not eyesy.menu_mode:
-                hwscreen.fill(eyesy.bg_color)
-
+            handle_menu_system(eyesy, hwscreen)
+        
+        # Update display
         pygame.display.flip()
-        eyesy.clear_flags()
+        
+        # Calculate FPS
+        if eyesy.frame_count % 30 == 0:
+            elapsed = current_time - start_time
+            eyesy.fps = 30 / elapsed if elapsed > 0 else 0
+            start_time = current_time
+        
+        # Periodic garbage collection
+        if eyesy.frame_count % 300 == 0:
+            gc.collect()
+        
+        # Maintain frame rate
+        clocker.tick(30)
 
+def update_system_state(eyesy, osc, shared_buffer, shared_buffer_r, gain, peak, peak_r, lock):
+    """Update all system inputs and state"""
+    # Process MIDI
+    midi.recv_ttymidi(eyesy)
+    midi.recv_usbmidi(eyesy)
+    
+    # Update controls
+    eyesy.update_knobs_and_notes()
+    eyesy.update_key_repeater()
+    eyesy.check_gain_knob()
+    eyesy.knob_seq_run()
+    eyesy.set_knobs()
+    
+    # Update LED
+    if eyesy.new_led:
+        osc.send("/led", eyesy.led)
+        eyesy.new_led = False
+    
+    # Process audio
+    process_audio(eyesy, shared_buffer, shared_buffer_r, gain, peak, peak_r, lock)
+
+def process_audio(eyesy, shared_buffer, shared_buffer_r, gain, peak, peak_r, lock):
+    """Handle audio processing and triggering"""
+    if not eyesy.key10_status:  # Normal audio mode
+        with lock:
+            eyesy.audio_in[:] = shared_buffer[:]
+            eyesy.audio_in_r[:] = shared_buffer_r[:]
+            g = eyesy.config["audio_gain"]
+            gain.value = float((g * g * 50) + 1)
+            eyesy.audio_peak = peak.value
+            eyesy.audio_peak_r = peak_r.value
+            
+            if eyesy.config["trigger_source"] in (0, 2):  # Audio or Audio+MIDI trigger
+                if eyesy.audio_peak > 20000 or eyesy.audio_peak_r > 20000:
+                    eyesy.trig = True
+    else:  # Test audio mode
+        if not eyesy.menu_mode:
+            eyesy.undulate_p += 0.005
+            undulate = ((math.sin(eyes.undulate_p * 2 * math.pi) + 1) * 2) + 0.5
+            for i in range(len(eyesy.audio_in)):
+                eyesy.audio_in[i] = int(math.sin((i / 100) * 2 * math.pi * undulate) * 25000)
+                eyesy.audio_in_r[i] = eyesy.audio_in[i]
+            eyesy.audio_peak = 25000
+            eyesy.audio_peak_r = 25000
+
+def handle_mode_rendering(eyesy, hwscreen, mode_screen):
+    """Handle the current mode's rendering"""
+    if not eyesy.menu_mode:
+        try:
+            # Get current mode
+            mode = sys.modules.get(eyesy.mode)
+            if mode is None:
+                raise ImportError(f"Mode {eyesy.mode} not loaded")
+            
+            # Clear screen if needed
+            if eyesy.auto_clear:
+                mode_screen.fill(eyesy.bg_color)
+            
+            # Run setup if requested
+            if eyesy.run_setup:
+                try:
+                    mode.setup(hwscreen, eyesy)
+                except Exception as e:
+                    logger.error(f"Mode setup failed: {e}")
+                eyesy.run_setup = False
+            
+            # Draw mode
+            try:
+                mode.draw(mode_screen, eyesy)
+            except Exception as e:
+                logger.error(f"Mode draw failed: {e}")
+                # Fallback display
+                mode_screen.fill((50, 50, 50))
+                font = pygame.font.SysFont(None, 48)
+                text = font.render("Mode Error", True, (255, 0, 0))
+                mode_screen.blit(text, (50, 50))
+            
+            # Blit to main screen
+            hwscreen.blit(mode_screen, (0, 0))
+            
+        except Exception as e:
+            logger.error(f"Mode handling failed: {e}")
+            eyesy.error = str(e)
+
+def handle_menu_system(eyesy, hwscreen):
+    """Handle menu rendering and input"""
+    try:
+        eyesy.current_screen.handle_events()
+        eyesy.current_screen.render_with_title(hwscreen)
+        
+        if eyesy.restart:
+            logger.info("Restart requested from menu")
+            exitexit(1)
+            
     except Exception as e:
-        eyesy.clear_flags()
-        eyesy.error = traceback.format_exc()
-        print("problem in main loop")
-        print(eyesy.error)
-        pygame.time.wait(200)
+        logger.error(f"Menu error: {e}")
+        eyesy.error = str(e)
+        hwscreen.fill(eyesy.bg_color)
 
-    # Limit to 30 FPS
-    clocker.tick(30)
-
-print("Quit")
+if __name__ == "__main__":
+    print("Starting EYESY...")
+    main()

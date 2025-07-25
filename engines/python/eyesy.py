@@ -20,10 +20,10 @@ class Eyesy:
     def __init__(self):
         self.VERSION = "3.0"
         # config stuff - updated paths to use home directory instead of /sdcard
-        self.GRABS_PATH = os.path.expanduser("~/Grabs/")
-        self.MODES_PATH = os.path.expanduser("~/Modes/")
-        self.SCENES_PATH = os.path.expanduser("~/Scenes/")
-        self.SYSTEM_PATH = os.path.expanduser("~/System/")
+        self.GRABS_PATH = os.path.expanduser("../../Grabs/")
+        self.MODES_PATH = os.path.expanduser("../../Modes/")
+        self.SCENES_PATH = os.path.expanduser("../../Scenes/")
+        self.SYSTEM_PATH = os.path.expanduser("../../System/")
 
         self.COMPVIDS = ["NTSC","NTSC-J","NTSC-443","PAL","PAL-M","PAL-N","PAL60","SECAM"]
 
